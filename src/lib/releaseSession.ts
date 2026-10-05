@@ -16,10 +16,13 @@ import { effectScope, ref, watch, type Ref } from 'vue';
 import type { ReleaseSlip } from './release';
 import {
   appendFailureWarning,
+  appendForkDecision,
   appendReleaseSlip,
   loadReleaseState,
   type StoredReleases
 } from './releaseStorage';
+import type { PrepareForkDecisionInput, ReleaseForkDecision } from './forkAdjudication';
+import { prepareForkDecision } from './forkAdjudication';
 import { useDraftSession } from './draftSession';
 import { useCalibrationSession } from './calibrationSession';
 
@@ -27,6 +30,10 @@ export interface IssueOutcome {
   ok: boolean;
   /** 写入失败时的告警文案；闸门不通过或成功时为 null。 */
   error: string | null;
+}
+
+export interface DecisionOutcome extends IssueOutcome {
+  duplicate?: boolean;
 }
 
 export interface ReleaseSession {
@@ -48,6 +55,7 @@ export interface ReleaseSession {
   /** 退出更正规程（取消或签发成功后）；不影响已带入的草稿内容。 */
   cancelCorrection: () => void;
   issue: (slip: ReleaseSlip) => IssueOutcome;
+  decideFork: (input: PrepareForkDecisionInput) => DecisionOutcome;
   reloadArchive: () => void;
 }
 
@@ -102,6 +110,29 @@ export function useReleaseSession(): ReleaseSession {
       return { ok: true, error: null };
     }
 
+    function decideFork(input: PrepareForkDecisionInput): DecisionOutcome {
+      const prepared = prepareForkDecision(archive.value.slips, archive.value.forkDecisions, input);
+      if (!prepared.ok) {
+        const first = prepared.errors[0];
+        const stale = first?.code === 'successor-set-stale' || first?.code === 'decision-stale';
+        return {
+          ok: false,
+          error: first?.message ?? appendFailureWarning(stale ? 'decision-stale' : 'decision-conflict').message
+        };
+      }
+      if (prepared.duplicate || !prepared.decision) {
+        reloadArchive();
+        return { ok: true, duplicate: true, error: null };
+      }
+      const decision: ReleaseForkDecision = prepared.decision;
+      const outcome = appendForkDecision(decision);
+      reloadArchive();
+      if (!outcome.ok) {
+        return { ok: false, error: appendFailureWarning(outcome.kind).message };
+      }
+      return { ok: true, duplicate: outcome.duplicate, error: null };
+    }
+
     // 闸门依据的任何变化都让当前授权立即失效（历史单据不受影响）。
     // 监听在单例作用域上，放行页未挂载时（如在单稿页改文字）同样生效。
     // 注意：文字 / 行宽是整体替换的原始值，不能与数组共用 deep 监听（deep 不追踪原始值替换）。
@@ -128,6 +159,7 @@ export function useReleaseSession(): ReleaseSession {
       beginCorrection,
       cancelCorrection,
       issue,
+      decideFork,
       reloadArchive
     };
   }) as ReleaseSession;

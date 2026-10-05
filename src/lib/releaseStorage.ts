@@ -22,6 +22,7 @@
  *    内存中仍保留最近一次完整记录，界面明确告警。
  */
 import { isWellFormedSlip, type ReleaseSlip } from './release';
+import { isWellFormedForkDecision, type ReleaseForkDecision } from './forkAdjudication';
 
 const STORAGE_KEY = 'braille-plate:release:v1';
 /**
@@ -43,9 +44,15 @@ export type AppendReleaseOutcome =
   | { ok: true }
   | { ok: false; kind: Extract<ReleaseStorageWarningKind, 'write-failed' | 'id-conflict' | 'write-contention'> };
 
+export type AppendForkDecisionOutcome =
+  | { ok: true; duplicate: boolean }
+  | { ok: false; kind: Extract<ReleaseStorageWarningKind, 'write-failed' | 'write-contention' | 'decision-conflict' | 'decision-stale'> };
+
 export interface StoredReleases {
   /** 可安全复核的历史放行单（签发顺序），冻结为只读。 */
   slips: ReleaseSlip[];
+  /** 独立、只追加的人工分叉裁决记录。 */
+  forkDecisions: ReleaseForkDecision[];
   /** 存档无法安全恢复时的告警；此时禁止任何写入。 */
   warning: ReleaseStorageWarning | null;
   /** true 表示当前 localStorage 存档处于保护态（损坏 / 版本不符）。 */
@@ -62,7 +69,10 @@ export type ReleaseStorageWarningKind =
   | 'write-failed'
   | 'id-conflict'
   | 'write-contention'
-  | 'cross-tab-repaired';
+  | 'cross-tab-repaired'
+  | 'invalid-decision'
+  | 'decision-conflict'
+  | 'decision-stale';
 
 export interface ReleaseStorageWarning {
   kind: ReleaseStorageWarningKind;
@@ -72,6 +82,7 @@ export interface ReleaseStorageWarning {
 interface VersionedReleases {
   version?: unknown;
   slips?: unknown;
+  forkDecisions?: unknown;
 }
 
 /**
@@ -79,6 +90,7 @@ interface VersionedReleases {
  * 界面仍可据此只读复核并明确告警，不会突然丢光历史。
  */
 let memorySlips: ReleaseSlip[] = [];
+let memoryDecisions: ReleaseForkDecision[] = [];
 
 /**
  * 本页签成功签发过的全部单据（跨页签覆盖后的认领依据）。
@@ -90,6 +102,7 @@ let memorySlips: ReleaseSlip[] = [];
  * 仍在线的其它页签补回，或已在主存档 / 冗余备份中。
  */
 const localIssued = new Map<string, ReleaseSlip>();
+const localIssuedDecisions = new Map<string, ReleaseForkDecision>();
 /** 跨页签修复等一次性状态提示，挂在下一次 loadReleaseState 的结果里。 */
 let pendingNotice: ReleaseStorageWarning | null = null;
 
@@ -121,6 +134,12 @@ function warningMessage(kind: ReleaseStorageWarningKind): string {
       return '多个页签同时签发放行单且持续交错：本次写入未能稳定落库，已停止重试，历史原存档逐字保留。请复核历史后重新签发。';
     case 'cross-tab-repaired':
       return '检测到其它页签的旧列表覆盖了放行存档（有已签发单据丢失）：已自动把本页签签发的单据合并补写回历史，全部单据可只读复核。';
+    case 'invalid-decision':
+      return `${prefix}存在结构损坏或引用不一致的分叉裁决记录，已停止恢复并保留原存档。${retain}`;
+    case 'decision-conflict':
+      return '两个页签对同一分叉作出了不同选择：已展示冲突，不能由最后写入者获胜。请基于最新存档中的全部冲突裁决重新裁决。';
+    case 'decision-stale':
+      return '分叉在裁决后又出现新的直接后继：原裁决已自动失效。请读取最新存档并重新绑定完整后继集合后再裁决。';
   }
 }
 
@@ -128,9 +147,10 @@ function makeWarning(kind: ReleaseStorageWarningKind): ReleaseStorageWarning {
   return { kind, message: warningMessage(kind) };
 }
 
-function protectedState(slips: ReleaseSlip[], kind: ReleaseStorageWarningKind): StoredReleases {
+function protectedState(slips: ReleaseSlip[], decisions: ReleaseForkDecision[], kind: ReleaseStorageWarningKind): StoredReleases {
   return {
     slips: slips.map((slip) => Object.freeze(slip) as ReleaseSlip),
+    forkDecisions: decisions.map((decision) => Object.freeze(decision) as ReleaseForkDecision),
     warning: makeWarning(kind),
     protected: true,
     notice: pendingNotice
@@ -144,7 +164,13 @@ function protectedState(slips: ReleaseSlip[], kind: ReleaseStorageWarningKind): 
 export function loadReleaseState(): StoredReleases {
   const notice = pendingNotice;
   pendingNotice = null;
-  const empty: StoredReleases = { slips: memorySlips.slice(), warning: null, protected: false, notice };
+  const empty: StoredReleases = {
+    slips: memorySlips.slice(),
+    forkDecisions: memoryDecisions.slice(),
+    warning: null,
+    protected: false,
+    notice
+  };
   const store = storage();
   if (!store) {
     return empty;
@@ -160,20 +186,36 @@ export function loadReleaseState(): StoredReleases {
     // 存储被清空（或从未写入）：内存缓存与本页签认领集合一并清空，
     // 既避免幽灵历史，也避免旧认领把单据“补回”一份被有意清空的存档。
     memorySlips = [];
+    memoryDecisions = [];
     localIssued.clear();
-    return { slips: [], warning: null, protected: false, notice };
+    localIssuedDecisions.clear();
+    return {
+      slips: [],
+      forkDecisions: [],
+      warning: null,
+      protected: false,
+      notice
+    };
   }
 
   const parsedRecord = parseVersionedReleases(raw);
   if (parsedRecord.ok) {
     memorySlips = parsedRecord.slips.slice();
-    return { slips: parsedRecord.slips, warning: null, protected: false, notice };
+    memoryDecisions = parsedRecord.forkDecisions.slice();
+    return {
+      slips: parsedRecord.slips,
+      forkDecisions: parsedRecord.forkDecisions,
+      warning: null,
+      protected: false,
+      notice
+    };
   }
 
   // 主存档不可信：先看冗余备份里有没有“最近一次完整记录”可只读取证。
   const backup = readBackup(store);
-  const fallbackSlips = memorySlips.length > 0 ? memorySlips : backup;
-  return protectedState(fallbackSlips, parsedRecord.kind);
+  const fallbackSlips = memorySlips.length > 0 ? memorySlips : backup.slips;
+  const fallbackDecisions = memoryDecisions.length > 0 ? memoryDecisions : backup.forkDecisions;
+  return protectedState(fallbackSlips, fallbackDecisions, parsedRecord.kind);
 }
 
 /**
@@ -182,7 +224,7 @@ export function loadReleaseState(): StoredReleases {
  * （编号冲突在直接签发时拦截，修复路径绝不覆盖任何已落库原件）。
  */
 function healAfterCrossTabWrite(store: Storage): void {
-  if (localIssued.size === 0) {
+  if (localIssued.size === 0 && localIssuedDecisions.size === 0) {
     return;
   }
   let raw: string | null = null;
@@ -201,9 +243,14 @@ function healAfterCrossTabWrite(store: Storage): void {
   }
 
   const presentIds = new Set(parsed.slips.map((slip) => slip.id));
-  const missing = [...localIssued.values()].filter((slip) => !presentIds.has(slip.id));
-  if (missing.length === 0) {
+  const presentDecisionIds = new Set(parsed.forkDecisions.map((decision) => decision.id));
+  const missingSlips = [...localIssued.values()].filter((slip) => !presentIds.has(slip.id));
+  const missingDecisions = [...localIssuedDecisions.values()].filter(
+    (decision) => !presentDecisionIds.has(decision.id)
+  );
+  if (missingSlips.length === 0 && missingDecisions.length === 0) {
     memorySlips = parsed.slips.slice();
+    memoryDecisions = parsed.forkDecisions.slice();
     return;
   }
 
@@ -214,13 +261,22 @@ function healAfterCrossTabWrite(store: Storage): void {
     if (!latest.ok) {
       return;
     }
-    const stillMissing = missing.filter((slip) => !latest.slips.some((existing) => existing.id === slip.id));
-    if (stillMissing.length === 0) {
+    const stillMissingSlips = missingSlips.filter((slip) => !latest.slips.some((existing) => existing.id === slip.id));
+    const stillMissingDecisions = missingDecisions.filter(
+      (decision) => !latest.forkDecisions.some((existing) => existing.id === decision.id)
+    );
+    if (stillMissingSlips.length === 0 && stillMissingDecisions.length === 0) {
       memorySlips = latest.slips.slice();
+      memoryDecisions = latest.forkDecisions.slice();
       return;
     }
-    const merged = [...latest.slips, ...stillMissing];
-    const mergedSerialized = JSON.stringify({ version: CURRENT_STORAGE_VERSION, slips: merged });
+    const mergedSlips = [...latest.slips, ...stillMissingSlips];
+    const mergedDecisions = [...latest.forkDecisions, ...stillMissingDecisions];
+    const mergedSerialized = JSON.stringify({
+      version: CURRENT_STORAGE_VERSION,
+      slips: mergedSlips,
+      forkDecisions: mergedDecisions
+    });
     try {
       store.setItem(STORAGE_KEY, mergedSerialized);
     } catch {
@@ -230,9 +286,13 @@ function healAfterCrossTabWrite(store: Storage): void {
     if (!verified.ok) {
       return;
     }
-    const healed = missing.every((slip) => verified.slips.some((existing) => existing.id === slip.id));
-    if (healed) {
+    const healedSlips = missingSlips.every((slip) => verified.slips.some((existing) => existing.id === slip.id));
+    const healedDecisions = missingDecisions.every((decision) =>
+      verified.forkDecisions.some((existing) => existing.id === decision.id)
+    );
+    if (healedSlips && healedDecisions) {
       memorySlips = verified.slips.slice();
+      memoryDecisions = verified.forkDecisions.slice();
       try {
         lastTrustedWrittenRaw = store.getItem(STORAGE_KEY) === mergedSerialized ? mergedSerialized : null;
       } catch {
@@ -240,7 +300,10 @@ function healAfterCrossTabWrite(store: Storage): void {
       }
       pendingNotice = makeWarning('cross-tab-repaired');
       try {
-        store.setItem(BACKUP_KEY, JSON.stringify({ version: CURRENT_STORAGE_VERSION, slips: verified.slips }));
+        store.setItem(
+          BACKUP_KEY,
+          JSON.stringify({ version: CURRENT_STORAGE_VERSION, slips: verified.slips, forkDecisions: verified.forkDecisions })
+        );
       } catch {
         // 备份失败不影响已完成的修复。
       }
@@ -264,22 +327,22 @@ if (typeof window !== 'undefined') {
   window.addEventListener('storage', onCrossTabStorage);
 }
 
-function readBackup(store: Storage): ReleaseSlip[] {
+function readBackup(store: Storage): { slips: ReleaseSlip[]; forkDecisions: ReleaseForkDecision[] } {
   let raw: string | null = null;
   try {
     raw = store.getItem(BACKUP_KEY);
   } catch {
-    return [];
+    return { slips: [], forkDecisions: [] };
   }
   if (!raw) {
-    return [];
+    return { slips: [], forkDecisions: [] };
   }
   const parsed = parseVersionedReleases(raw);
-  return parsed.ok ? parsed.slips : [];
+  return parsed.ok ? { slips: parsed.slips, forkDecisions: parsed.forkDecisions } : { slips: [], forkDecisions: [] };
 }
 
 type ParsedReleases =
-  | { ok: true; slips: ReleaseSlip[] }
+  | { ok: true; slips: ReleaseSlip[]; forkDecisions: ReleaseForkDecision[] }
   | { ok: false; kind: ReleaseStorageWarningKind };
 
 /**
@@ -330,10 +393,85 @@ function parseVersionedReleases(
     }
     slips.push(Object.freeze(candidate) as ReleaseSlip);
   }
+  const decisionCandidates = parsed.forkDecisions === undefined ? [] : parsed.forkDecisions;
+  if (!Array.isArray(decisionCandidates)) {
+    lastFullyValidatedRaw = null;
+    return { ok: false, kind: 'corrupted-record' };
+  }
+  const forkDecisions: ReleaseForkDecision[] = [];
+  for (const candidate of decisionCandidates) {
+    if (!isWellFormedForkDecision(candidate) || !decisionReferencesSlips(candidate, slips, forkDecisions, decisionCandidates)) {
+      lastFullyValidatedRaw = null;
+      return { ok: false, kind: 'invalid-decision' };
+    }
+    forkDecisions.push(Object.freeze(candidate) as ReleaseForkDecision);
+  }
+  if (new Set(forkDecisions.map((decision) => decision.id)).size !== forkDecisions.length) {
+    lastFullyValidatedRaw = null;
+    return { ok: false, kind: 'invalid-decision' };
+  }
   if (options.recompute) {
     lastFullyValidatedRaw = raw;
   }
-  return { ok: true, slips };
+  return { ok: true, slips, forkDecisions };
+}
+
+function knownDecisionMap(
+  previousDecisions: readonly ReleaseForkDecision[],
+  allDecisionCandidates: readonly unknown[]
+): Map<string, ReleaseForkDecision> {
+  const knownDecisions = new Map<string, ReleaseForkDecision>();
+  for (const candidate of allDecisionCandidates) {
+    if (isWellFormedForkDecision(candidate) && !knownDecisions.has(candidate.id)) {
+      knownDecisions.set(candidate.id, candidate);
+    }
+  }
+  for (const item of previousDecisions) {
+    knownDecisions.set(item.id, item);
+  }
+  return knownDecisions;
+}
+
+/**
+ * 裁决与放行单图的交叉引用校验。只验证记录自身和被引用单据：
+ * 后来新增直接后继会让旧裁决在领域分析中变为 stale，但这是合法历史记录，
+ * 绝不能因此进入保护态或拒绝读取旧档。
+ */
+function decisionReferencesSlips(
+  decision: ReleaseForkDecision,
+  slips: readonly ReleaseSlip[],
+  previousDecisions: readonly ReleaseForkDecision[],
+  allDecisionCandidates: readonly unknown[]
+): boolean {
+  const knownDecisions = knownDecisionMap(previousDecisions, allDecisionCandidates);
+  const storedSuccessorIds = new Set(decision.successorIds);
+  // 历史记录可能已被后续新后继扩展，也可能只剩一部分引用；裁决中列出的每个
+  // 后继都必须真实存在且当时指向该分叉点。虚构编号 / 错误分叉才是存档损坏。
+  const slipIds = new Set(slips.map((slip) => slip.id));
+  const successorsExist = decision.successorIds.every((id) => slipIds.has(id));
+  const successorsPointToParent = slips.every(
+    (slip) => !storedSuccessorIds.has(slip.id) || slip.correction?.supersedesId === decision.forkParentId
+  );
+  return (
+    slipIds.has(decision.forkParentId) &&
+    successorsExist &&
+    successorsPointToParent &&
+    supersedeReferencesValid(decision, knownDecisions)
+  );
+}
+
+function supersedeReferencesValid(
+  decision: ReleaseForkDecision,
+  knownDecisions: ReadonlyMap<string, ReleaseForkDecision>
+): boolean {
+  return (
+    !decision.supersedesDecisionIds.includes(decision.id) &&
+    decision.supersedesDecisionIds.every((id) => knownDecisions.get(id)?.forkParentId === decision.forkParentId)
+  );
+}
+
+function sameOrderedIdSet(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && new Set(left).size === left.length && left.every((id) => right.includes(id));
 }
 
 /**
@@ -381,6 +519,7 @@ export function appendReleaseSlip(slip: ReleaseSlip): AppendReleaseOutcome {
       // 相同编号：内容逐字一致才是幂等的同一张单据；否则是明确的编号冲突。
       if (slipContentEqual(current.slips[existingIndex], slip)) {
         memorySlips = current.slips.slice();
+        memoryDecisions = current.forkDecisions.slice();
         localIssued.set(slip.id, current.slips[existingIndex]);
         return { ok: true };
       }
@@ -389,7 +528,11 @@ export function appendReleaseSlip(slip: ReleaseSlip): AppendReleaseOutcome {
 
     // 历史只增不减：直接追加，不截断、不顶掉最早单据。
     const next = [...current.slips, slip];
-    const serialized = JSON.stringify({ version: CURRENT_STORAGE_VERSION, slips: next });
+    const serialized = JSON.stringify({
+      version: CURRENT_STORAGE_VERSION,
+      slips: next,
+      forkDecisions: current.forkDecisions
+    });
     try {
       store.setItem(STORAGE_KEY, serialized);
     } catch {
@@ -411,6 +554,7 @@ export function appendReleaseSlip(slip: ReleaseSlip): AppendReleaseOutcome {
     // 确认稳定落库后再刷新冗余备份；备份失败不影响本次签发（主记录完整可恢复），
     // 但会影响下次“主记录被外部改坏”时的取证余量，故静默保留内存最近完整记录。
     memorySlips = verified.slips.slice();
+    memoryDecisions = verified.forkDecisions.slice();
     localIssued.set(slip.id, slip);
     // 只有当前主存档与本次写回逐字节相同，后续追加才允许跳过重算。
     try {
@@ -419,7 +563,10 @@ export function appendReleaseSlip(slip: ReleaseSlip): AppendReleaseOutcome {
       lastTrustedWrittenRaw = null;
     }
     try {
-      store.setItem(BACKUP_KEY, JSON.stringify({ version: CURRENT_STORAGE_VERSION, slips: verified.slips }));
+      store.setItem(
+        BACKUP_KEY,
+        JSON.stringify({ version: CURRENT_STORAGE_VERSION, slips: verified.slips, forkDecisions: verified.forkDecisions })
+      );
     } catch {
       // 忽略备份失败：主记录与内存缓存均已是完整记录。
     }
@@ -427,6 +574,109 @@ export function appendReleaseSlip(slip: ReleaseSlip): AppendReleaseOutcome {
   }
 
   // 重试上限：极端持续交错下也明确失败，绝不静默丢单或无限循环写爆配额。
+  return { ok: false, kind: 'write-contention' };
+}
+
+function serializeRecord(slips: readonly ReleaseSlip[], forkDecisions: readonly ReleaseForkDecision[]): string {
+  return JSON.stringify({ version: CURRENT_STORAGE_VERSION, slips, forkDecisions });
+}
+
+/**
+ * 追加人工分叉裁决。裁决是独立的只追加记录：放行单 / 更正单均不修改。
+ *
+ * 写入前必须重新读取最新存档并核对裁决绑定的完整直接后继集合：迟到新分支
+ * 会让裁决自动失效并拒绝该次旧写入。不同页签的不同选择则各自追加保留，
+ * 由纯链分析显示为 conflict，绝不以后写记录覆盖先写结论。
+ */
+export function appendForkDecision(decision: ReleaseForkDecision): AppendForkDecisionOutcome {
+  if (!isWellFormedForkDecision(decision)) {
+    return { ok: false, kind: 'write-failed' };
+  }
+  const store = storage();
+  if (!store) {
+    return { ok: false, kind: 'write-failed' };
+  }
+  const initial = readForAppend(store);
+  if (!initial.ok) {
+    return { ok: false, kind: 'write-failed' };
+  }
+
+  for (let attempt = 0; attempt < MAX_APPEND_ATTEMPTS; attempt += 1) {
+    const current = readForAppend(store);
+    if (!current.ok) {
+      return { ok: false, kind: 'write-failed' };
+    }
+
+    const existing = current.forkDecisions.find((item) => item.id === decision.id);
+    if (existing) {
+      if (JSON.stringify(existing) === JSON.stringify(decision)) {
+        memorySlips = current.slips.slice();
+        memoryDecisions = current.forkDecisions.slice();
+        localIssuedDecisions.set(decision.id, existing);
+        return { ok: true, duplicate: true };
+      }
+      return { ok: false, kind: 'write-failed' };
+    }
+
+    const semanticDuplicate = current.forkDecisions.some(
+      (item) =>
+        item.forkParentId === decision.forkParentId &&
+        sameOrderedIdSet(item.successorIds, decision.successorIds) &&
+        item.selectedSuccessorId === decision.selectedSuccessorId &&
+        // 只折叠相同裁决轮次的重复提交；显式重新裁决（带 supersedes）必须留痕。
+        item.supersedesDecisionIds.length === decision.supersedesDecisionIds.length
+    );
+    if (semanticDuplicate) {
+      memorySlips = current.slips.slice();
+      memoryDecisions = current.forkDecisions.slice();
+      return { ok: true, duplicate: true };
+    }
+
+    const currentSuccessors = current.slips
+      .filter((slip) => slip.correction?.supersedesId === decision.forkParentId)
+      .map((slip) => slip.id);
+    // 新写入的裁决必须精确绑定当前完整后继集合；存档中已经存在的旧裁决
+    // 可以是子集，并在领域分析中标记为 stale。
+    if (!sameOrderedIdSet(currentSuccessors, decision.successorIds)) {
+      return { ok: false, kind: 'decision-stale' };
+    }
+    if (
+      decision.supersedesDecisionIds.includes(decision.id) ||
+      !decision.supersedesDecisionIds.every((id) => current.forkDecisions.some((item) => item.id === id))
+    ) {
+      return { ok: false, kind: 'write-failed' };
+    }
+
+    const serialized = serializeRecord(current.slips, [...current.forkDecisions, decision]);
+    try {
+      store.setItem(STORAGE_KEY, serialized);
+    } catch {
+      return { ok: false, kind: 'write-failed' };
+    }
+
+    const verified = readFreshSlips(store);
+    if (!verified.ok) {
+      return { ok: false, kind: 'write-failed' };
+    }
+    if (!verified.forkDecisions.some((item) => item.id === decision.id)) {
+      continue;
+    }
+
+    memorySlips = verified.slips.slice();
+    memoryDecisions = verified.forkDecisions.slice();
+    localIssuedDecisions.set(decision.id, decision);
+    try {
+      lastTrustedWrittenRaw = store.getItem(STORAGE_KEY) === serialized ? serialized : null;
+    } catch {
+      lastTrustedWrittenRaw = null;
+    }
+    try {
+      store.setItem(BACKUP_KEY, serializeRecord(verified.slips, verified.forkDecisions));
+    } catch {
+      // 备份失败不影响主存档中的裁决记录。
+    }
+    return { ok: true, duplicate: false };
+  }
   return { ok: false, kind: 'write-contention' };
 }
 
@@ -443,7 +693,7 @@ function readForAppend(store: Storage): ParsedReleases {
     return { ok: false, kind: 'corrupted-record' };
   }
   if (!raw) {
-    return { ok: true, slips: [] };
+    return { ok: true, slips: [], forkDecisions: [] };
   }
   return parseVersionedReleases(raw, { recompute: raw !== lastTrustedWrittenRaw });
 }
@@ -459,7 +709,7 @@ function readFreshSlips(store: Storage): ParsedReleases {
     return { ok: false, kind: 'corrupted-record' };
   }
   if (!raw) {
-    return { ok: true, slips: [] };
+    return { ok: true, slips: [], forkDecisions: [] };
   }
   // 追加 / 修复循环刚写回：旧单据都已完整校验且未变，只需结构校验确认
   // 写回完整、新单可解析；是否被外部改坏由下一次完整 loadReleaseState 兜底。
@@ -476,14 +726,18 @@ function slipContentEqual(left: ReleaseSlip, right: ReleaseSlip): boolean {
 }
 
 /** 供界面展示指定失败类别的告警文案（不产生任何写入）。 */
-export function appendFailureWarning(kind: 'write-failed' | 'id-conflict' | 'write-contention'): ReleaseStorageWarning {
+export function appendFailureWarning(
+  kind: 'write-failed' | 'id-conflict' | 'write-contention' | 'decision-conflict' | 'decision-stale'
+): ReleaseStorageWarning {
   return makeWarning(kind);
 }
 
 /** 测试辅助：清空进程内最近一次完整记录、跨页签认领集合与一次性提示。 */
 export function __resetReleaseMemoryForTests(): void {
   memorySlips = [];
+  memoryDecisions = [];
   localIssued.clear();
+  localIssuedDecisions.clear();
   pendingNotice = null;
   lastFullyValidatedRaw = null;
   lastTrustedWrittenRaw = null;
@@ -499,6 +753,9 @@ export function clearReleaseState(): boolean {
     store.removeItem(STORAGE_KEY);
     store.removeItem(BACKUP_KEY);
     memorySlips = [];
+    memoryDecisions = [];
+    localIssued.clear();
+    localIssuedDecisions.clear();
     lastFullyValidatedRaw = null;
     lastTrustedWrittenRaw = null;
     return true;

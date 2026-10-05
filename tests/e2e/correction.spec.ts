@@ -244,6 +244,145 @@ test.describe('放行单更正：双页签分叉', () => {
   });
 });
 
+test.describe('放行单更正：人工分叉裁决', () => {
+  function forkPanel(page: import('@playwright/test').Page, parentId: string) {
+    return page.locator(`[data-testid="fork-adjudication"][data-fork-parent="${parentId}"]`);
+  }
+
+  async function decideFork(
+    page: import('@playwright/test').Page,
+    parentId: string,
+    successorId: string,
+    reason: string
+  ) {
+    const panel = forkPanel(page, parentId);
+    await panel.locator(`[data-testid="fork-choice"][value="${successorId}"]`).check();
+    await panel.getByTestId('fork-reason').fill(reason);
+    await panel.getByTestId('fork-decide').click();
+  }
+
+  async function issueCorrectionFrom(page: import('@playwright/test').Page, parentId: string, text: string, reason: string) {
+    await beginCorrection(page, parentId);
+    await page.getByTestId('mode-single').click();
+    await page.getByTestId('phrase-input').fill(text);
+    await page.getByTestId('mode-release').click();
+    await page.getByTestId('correction-reason').fill(reason);
+    await page.getByTestId('correction-issue').click();
+    await expect(page.getByTestId('release-active')).toBeVisible();
+    const id = ((await page.getByTestId('release-active').getByTestId('slip-id').textContent()) ?? '').replace(
+      '放行单号：',
+      ''
+    );
+    return id;
+  }
+
+  test('双页签冲突不最后写入获胜；迟到分支失效旧裁决；嵌套分叉全部裁决后才认定终端', async ({ page, context }) => {
+    await page.goto('/');
+    const originalId = await issueOriginal(page);
+    const other = await context.newPage();
+    await other.goto('/');
+    await other.getByTestId('mode-release').click();
+
+    const correctionAId = await issueCorrectionFrom(page, originalId, '12，四。', '页签甲更正');
+    const correctionBId = await issueCorrectionFrom(other, originalId, '12，五。', '页签乙更正');
+
+    // 两个页签都读取到同一分叉；暂时拦截自动 storage 事件，构造双方基于同一存档并发裁决。
+    await page.evaluate((key) => {
+      window.dispatchEvent(new StorageEvent('storage', { key }));
+    }, RELEASE_KEY);
+    await expect(forkPanel(page, originalId)).toBeVisible();
+    await expect(forkPanel(other, originalId)).toBeVisible();
+
+    const blocker = String.raw`(event) => {
+      if (event.key === 'braille-plate:release:v1') event.stopImmediatePropagation();
+    }`;
+    await page.evaluate((fn) => window.addEventListener('storage', eval(`(${fn})`), true), blocker);
+    await other.evaluate((fn) => window.addEventListener('storage', eval(`(${fn})`), true), blocker);
+
+    await decideFork(other, originalId, correctionAId, '另一页签裁定 A');
+    await decideFork(page, originalId, correctionBId, '本页签裁定 B');
+
+    // 刷新后双方看到同一个冲突，而不是后写的 B 覆盖 A。
+    await page.reload();
+    await other.reload();
+    await page.getByTestId('mode-release').click();
+    await other.getByTestId('mode-release').click();
+    await expect(page.getByTestId('correction-fork-conflict-warning')).toContainText('不同选择');
+    await expect(other.getByTestId('correction-fork-conflict-warning')).toContainText('不同选择');
+    await expect(forkPanel(page, originalId)).toContainText(correctionAId);
+    await expect(forkPanel(page, originalId)).toContainText(correctionBId);
+
+    // 基于最新存档重新裁决，明确取代两条冲突记录。
+    await decideFork(page, originalId, correctionAId, '查看冲突后仍采用 A');
+    await expect(forkPanel(page, originalId)).toContainText('当前裁决选择');
+    await expect(page.locator(`[data-slip-id="${correctionAId}"]`).getByTestId('chain-status')).toContainText(
+      '人工裁决后的现行终端'
+    );
+    await expect(page.locator(`[data-slip-id="${correctionBId}"]`).getByTestId('chain-status')).toContainText(
+      '未选分支'
+    );
+
+    // 迟到的第三直接后继使原裁决自动失效，不得提前认定任何终端现行。
+    const correctionCId = await issueCorrectionFrom(page, originalId, '12，六。', '迟到新分支');
+    await expect(page.getByTestId('fork-stale-warning')).toContainText('自动失效');
+    await expect(page.getByTestId('chain-status').filter({ hasText: '现行终端' })).toHaveCount(0);
+    await expect(forkPanel(page, originalId)).toContainText(correctionCId);
+
+    // 外层重新选择 A，但 A 内部随后又形成嵌套分叉：只能显示被阻断路径。
+    const nestedAId = await issueCorrectionFrom(page, correctionAId, '12，七。', 'A 分支嵌套一');
+    const nestedBId = await issueCorrectionFrom(page, correctionAId, '12，八。', 'A 分支嵌套二');
+    await decideFork(page, originalId, correctionAId, '三分支并存后仍选 A');
+    await expect(page.locator(`[data-slip-id="${correctionAId}"]`).getByTestId('chain-status')).toContainText(
+      '下游仍有未裁决分叉'
+    );
+    await expect(page.getByTestId('chain-status').filter({ hasText: '现行终端' })).toHaveCount(0);
+
+    // 嵌套分叉裁决后，只有选中的嵌套终端成为现行；B/C 及其下游都不是现行。
+    await decideFork(page, correctionAId, nestedBId, '嵌套分叉选择 B 终端');
+    await expect(page.locator(`[data-slip-id="${nestedBId}"]`).getByTestId('chain-status')).toContainText(
+      '人工裁决后的现行终端'
+    );
+    await expect(page.locator(`[data-slip-id="${nestedAId}"]`).getByTestId('chain-status')).toContainText(
+      '未选分支'
+    );
+    await expect(page.locator(`[data-slip-id="${correctionCId}"]`).getByTestId('chain-status')).toContainText(
+      '未选分支'
+    );
+
+    const stored = await page.evaluate((key) => JSON.parse(window.localStorage.getItem(key) ?? '{}'), RELEASE_KEY);
+    expect(stored.slips).toHaveLength(6);
+    expect(stored.forkDecisions.length).toBeGreaterThanOrEqual(4);
+    // 原放行单与所有更正单仍没有被塞入裁决字段。
+    expect(stored.slips.every((slip: { forkDecision?: unknown }) => slip.forkDecision === undefined)).toBe(true);
+    await other.close();
+  });
+
+  test('存档保护态下人工裁决拒写，更正原档保留，历史仍可只读取证', async ({ page }) => {
+    await page.goto('/');
+    const originalId = await issueOriginal(page);
+    const correctionAId = await issueCorrectionFrom(page, originalId, '12，四。', '甲');
+    const other = await page.context().newPage();
+    await other.goto('/');
+    await other.getByTestId('mode-release').click();
+    const correctionBId = await issueCorrectionFrom(other, originalId, '12，五。', '乙');
+    await page.evaluate((key) => window.dispatchEvent(new StorageEvent('storage', { key })), RELEASE_KEY);
+    const before = await page.evaluate((key) => window.localStorage.getItem(key), RELEASE_KEY);
+
+    await page.evaluate((key) => {
+      window.localStorage.setItem(key, '{不是合法 JSON');
+      window.dispatchEvent(new StorageEvent('storage', { key }));
+    }, RELEASE_KEY);
+
+    await expect(page.getByTestId('release-archive-warning')).toContainText('无法安全恢复');
+    await expect(forkPanel(page, originalId).getByTestId('fork-decide')).toBeDisabled();
+    await expect(page.getByTestId('release-history-item')).toHaveCount(3);
+    expect(await page.evaluate((key) => window.localStorage.getItem(key), RELEASE_KEY)).toBe('{不是合法 JSON');
+    expect(before).toContain(correctionAId);
+    expect(before).toContain(correctionBId);
+    await other.close();
+  });
+});
+
 test.describe('放行单更正：失败保护', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/');

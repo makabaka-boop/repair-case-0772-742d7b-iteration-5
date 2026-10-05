@@ -8,11 +8,13 @@ import {
   type ReleaseSlip
 } from '../lib/release';
 import {
-  analyzeCorrectionChains,
-  createCorrectionSlip,
-  isInCorrectionChain,
-  type CorrectionChainStatus
-} from '../lib/correction';
+  analyzeForkAdjudications,
+  type AdjudicatedChainStatus,
+  type BranchTerminalTrace,
+  type ForkAdjudicationState,
+  type ReleaseForkDecision
+} from '../lib/forkAdjudication';
+import { createCorrectionSlip } from '../lib/correction';
 import { useDraftSession } from '../lib/draftSession';
 import { useCalibrationSession } from '../lib/calibrationSession';
 import { useReleaseSession } from '../lib/releaseSession';
@@ -80,12 +82,81 @@ const canIssueCorrection = computed(
   () => correctionTarget.value !== null && !correctionReasonEmpty.value && canRelease.value
 );
 
-/** 更正链分析：与领域校验、只追加存档、共享会话同一份关联数据。 */
-const chainInfo = computed(() => analyzeCorrectionChains(archive.value.slips));
-const correctionForks = computed(() => chainInfo.value.forks);
+/** 更正链与人工裁决联合分析：链分析、存储、共享会话和徽标共用同一状态。 */
+const chainInfo = computed(() =>
+  analyzeForkAdjudications(archive.value.slips, archive.value.forkDecisions)
+);
+const correctionForks = computed(() => [...chainInfo.value.forks.values()]);
+const conflictingForks = computed(() => correctionForks.value.filter((fork) => fork.state === 'conflicting'));
+const staleForks = computed(() =>
+  correctionForks.value.filter((fork) => fork.state === 'pending' && fork.staleDecisionIds.length > 0)
+);
 
-function chainStatusOf(slip: ReleaseSlip): CorrectionChainStatus | null {
-  if (!isInCorrectionChain(chainInfo.value, slip)) {
+type AnyChainStatus = AdjudicatedChainStatus | import('../lib/correction').CorrectionChainStatus;
+const adjudicationForms = ref<Record<string, { selected: string; reason: string }>>({});
+
+function forkStateOf(parentId: string): ForkAdjudicationState | null {
+  return chainInfo.value.forks.get(parentId) ?? null;
+}
+
+function forkTraces(parentId: string): BranchTerminalTrace[] {
+  return chainInfo.value.tracesByFork.get(parentId) ?? [];
+}
+
+function forkDecisions(parentId: string): ReleaseForkDecision[] {
+  return chainInfo.value.decisionsByFork.get(parentId) ?? [];
+}
+
+function formForFork(fork: ForkAdjudicationState) {
+  if (!adjudicationForms.value[fork.forkParentId]) {
+    const selected = fork.state === 'conflicting' ? '' : fork.selectedSuccessorId ?? '';
+    adjudicationForms.value[fork.forkParentId] = { selected, reason: '' };
+  }
+  return adjudicationForms.value[fork.forkParentId];
+}
+
+function canAdjudicate(fork: ForkAdjudicationState): boolean {
+  if (archive.value.protected) {
+    return false;
+  }
+  const form = formForFork(fork);
+  return fork.successorIds.includes(form.selected) && form.reason.trim() !== '';
+}
+
+function submitAdjudication(fork: ForkAdjudicationState) {
+  const form = formForFork(fork);
+  writeError.value = null;
+  // 只有 pending 初次裁决不带 supersedes；resolved / conflicting 的任何新选择
+  // 都必须明确基于当前活动裁决，不能凭更晚写入覆盖。
+  const supersedes = fork.state === 'pending' ? [] : fork.activeDecisionIds;
+  const outcome = session.decideFork({
+    forkParentId: fork.forkParentId,
+    successorIds: fork.successorIds,
+    selectedSuccessorId: form.selected,
+    reason: form.reason,
+    supersedesDecisionIds: supersedes
+  });
+  if (!outcome.ok) {
+    writeError.value = outcome.error;
+    session.reloadArchive();
+    return;
+  }
+  form.reason = '';
+  session.reloadArchive();
+}
+
+function traceText(trace: BranchTerminalTrace): string {
+  if (trace.status === 'terminal' && trace.terminalId) {
+    return `可追溯终端：${trace.terminalId}`;
+  }
+  if (trace.status === 'unresolved-fork' && trace.stoppedAtForkId) {
+    return `内部仍有未裁决分叉：${trace.stoppedAtForkId}，暂不能宣布终端现行`;
+  }
+  return '更正链存在循环，暂不能追溯终端';
+}
+
+function chainStatusOf(slip: ReleaseSlip): AnyChainStatus | null {
+  if (!slip.correction && (chainInfo.value.childrenById.get(slip.id)?.length ?? 0) === 0) {
     return null;
   }
   return chainInfo.value.statusById.get(slip.id) ?? null;
@@ -94,9 +165,24 @@ function chainStatusOf(slip: ReleaseSlip): CorrectionChainStatus | null {
 function chainStatusText(slip: ReleaseSlip): string {
   const status = chainStatusOf(slip);
   const children = chainInfo.value.childrenById.get(slip.id) ?? [];
+  const fork = forkStateOf(slip.id);
   switch (status) {
     case 'current':
       return '更正链现行版本';
+    case 'adjudicated-current':
+      return '人工裁决后的现行终端';
+    case 'adjudicated-path':
+      return '人工裁决选中路径（非终端）';
+    case 'adjudicated-blocked-path':
+      return '裁决选中路径，但下游仍有未裁决分叉';
+    case 'adjudicated-rejected-branch':
+      return '人工裁决未选分支：不作现行认定';
+    case 'fork-adjudicated':
+      return `分叉已裁决：继续沿 ${fork?.selectedSuccessorId ?? ''} 追溯`;
+    case 'fork-conflict':
+      return '分叉裁决冲突：须基于最新存档重新裁决';
+    case 'fork-decision-stale':
+      return '旧分叉裁决因新增分支自动失效';
     case 'superseded':
       return `已被更正单 ${children[0]?.id ?? ''} 取代`;
     case 'forked':
@@ -356,18 +442,48 @@ onMounted(() => {
 
     <div
       v-if="correctionForks.length > 0"
-      class="correction-fork-warning"
-      role="alert"
+      class="correction-fork-warning pending"
+      role="status"
       data-testid="correction-fork-warning"
     >
-      <h3>更正链存在分叉冲突</h3>
+      <h3>更正链存在分叉冲突，需要人工裁决</h3>
+      <p>系统不会仅凭时间先后挑选现行单；请在分叉点详情查看每条直接后继的可追溯终端后明确裁决。</p>
+      <ul>
+        <li v-for="fork in correctionForks.filter((item) => item.state === 'pending')" :key="fork.forkParentId" data-testid="correction-fork-item">
+          原单 <strong>{{ fork.forkParentId }}</strong>：更正单 {{ fork.successorIds.join('、') }} 同时指向它
+        </li>
+      </ul>
+    </div>
+
+    <div
+      v-if="conflictingForks.length > 0"
+      class="correction-fork-warning"
+      role="alert"
+      data-testid="correction-fork-conflict-warning"
+    >
+      <h3>分叉裁决存在冲突</h3>
       <p>
-        以下单据被多张更正单同时指向（可能由多页签同时更正合并产生）：已停止自动认定现行版本，
-        不会仅凭时间先后挑选现行单；全部原件保留取证，请人工核对处理。
+        两个页签对同一分叉作出了不同选择，系统不会采用“最后写入者获胜”。
+        请基于下方最新存档中的全部冲突记录重新裁决；旧裁决只追加保留，不修改或删除。
       </p>
       <ul>
-        <li v-for="fork in correctionForks" :key="fork.parentId" data-testid="correction-fork-item">
-          原单 <strong>{{ fork.parentId }}</strong>：更正单 {{ fork.slipIds.join('、') }} 同时指向它
+        <li v-for="fork in conflictingForks" :key="fork.forkParentId" data-testid="fork-conflict-item">
+          分叉点 <strong>{{ fork.forkParentId }}</strong>：{{ fork.activeDecisionIds.join('、') }} 的选择不同
+        </li>
+      </ul>
+    </div>
+
+    <div
+      v-if="staleForks.length > 0"
+      class="correction-fork-warning stale"
+      role="alert"
+      data-testid="fork-stale-warning"
+    >
+      <h3>旧分叉裁决已自动失效</h3>
+      <ul>
+        <li v-for="fork in staleForks" :key="fork.forkParentId" data-testid="fork-stale-item">
+          分叉点 <strong>{{ fork.forkParentId }}</strong> 后来出现新直接后继，旧裁决
+          {{ fork.staleDecisionIds.join('、') }} 不再作为现行依据。
         </li>
       </ul>
     </div>
@@ -393,6 +509,94 @@ onMounted(() => {
           {{ chainStatusText(slip) }}
         </p>
         <ReleaseSlipCard :slip="slip" />
+        <section
+          v-if="forkStateOf(slip.id)"
+          class="fork-adjudication"
+          :data-state="forkStateOf(slip.id)?.state"
+          data-testid="fork-adjudication"
+          :data-fork-parent="slip.id"
+        >
+          <h4>人工分叉裁决</h4>
+          <p class="fork-binding" data-testid="fork-successor-set">
+            当前完整直接后继集合：<strong>{{ forkStateOf(slip.id)?.successorIds.join('、') }}</strong>
+          </p>
+          <ul class="fork-branches">
+            <li
+              v-for="trace in forkTraces(slip.id)"
+              :key="trace.successorId"
+              class="fork-branch"
+              data-testid="correction-fork-item"
+              :data-successor="trace.successorId"
+            >
+              <p>
+                直接后继 <strong>{{ trace.successorId }}</strong>
+                ；追溯路径 {{ trace.path.join(' → ') }}
+              </p>
+              <p :data-testid="`fork-terminal-${trace.successorId}`">{{ traceText(trace) }}</p>
+            </li>
+          </ul>
+
+          <div v-if="forkStateOf(slip.id)?.state === 'resolved'" class="fork-current-choice" data-testid="fork-resolved">
+            当前裁决选择：<strong>{{ forkStateOf(slip.id)?.selectedSuccessorId }}</strong>
+            （裁决 {{ forkStateOf(slip.id)?.activeDecisionIds.join('、') }}）。不同选择必须基于该最新裁决重新提交。
+          </div>
+          <div v-else-if="forkStateOf(slip.id)?.state === 'conflicting'" class="fork-current-choice conflict" data-testid="fork-conflict-detail">
+            冲突裁决：
+            <span v-for="(ids, choice) in forkStateOf(slip.id)?.conflictingChoiceIds" :key="choice">
+              选择 {{ choice }}：{{ ids.join('、') }}；
+            </span>
+            重新裁决将绑定并取代全部活动冲突裁决。
+          </div>
+          <div v-else-if="forkStateOf(slip.id)?.staleDecisionIds.length" class="fork-current-choice stale" data-testid="fork-stale-detail">
+            旧裁决 {{ forkStateOf(slip.id)?.staleDecisionIds.join('、') }} 已因后继集合变化失效。
+          </div>
+
+          <div v-if="forkDecisions(slip.id).length" class="decision-log" data-testid="decision-log">
+            <h5>只追加裁决记录</h5>
+            <ul>
+              <li v-for="decision in forkDecisions(slip.id)" :key="decision.id" :data-decision-id="decision.id">
+                {{ decision.id }}：选择 {{ decision.selectedSuccessorId }}；原因：{{ decision.reason }}
+                <span v-if="decision.supersedesDecisionIds.length">；取代 {{ decision.supersedesDecisionIds.join('、') }}</span>
+              </li>
+            </ul>
+          </div>
+
+          <form class="decision-form" @submit.prevent="submitAdjudication(forkStateOf(slip.id)!)">
+            <fieldset>
+              <legend>选择一条直接后继继续追溯</legend>
+              <label v-for="successorId in forkStateOf(slip.id)?.successorIds ?? []" :key="successorId">
+                <input
+                  type="radio"
+                  :name="`fork-choice-${slip.id}`"
+                  :value="successorId"
+                  v-model="formForFork(forkStateOf(slip.id)!).selected"
+                  data-testid="fork-choice"
+                  :data-fork-parent="slip.id"
+                />
+                {{ successorId }}
+              </label>
+            </fieldset>
+            <label class="field">
+              <span class="field-label">裁决原因（必填）</span>
+              <textarea
+                v-model="formForFork(forkStateOf(slip.id)!).reason"
+                rows="2"
+                data-testid="fork-reason"
+                :data-fork-parent="slip.id"
+              ></textarea>
+            </label>
+            <button
+              type="submit"
+              class="compare-btn"
+              data-testid="fork-decide"
+              :data-fork-parent="slip.id"
+              :disabled="!canAdjudicate(forkStateOf(slip.id)!)"
+            >
+              {{ forkStateOf(slip.id)?.state === 'conflicting' ? '基于最新存档重新裁决' : '提交分叉裁决' }}
+            </button>
+          </form>
+        </section>
+
         <div
           v-if="pendingCorrection?.id === slip.id"
           class="correction-confirm"

@@ -1117,6 +1117,88 @@ input[type='number'].input-invalid:focus,
   font-weight: 700;
 }
 
+.correction-fork-warning.pending {
+  border-color: #d7a64a;
+  background: #fff7e4;
+}
+
+.correction-fork-warning.stale {
+  border-color: #9aa4b2;
+  background: #f2f4f7;
+}
+
+.fork-adjudication {
+  margin: 10px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.fork-adjudication h4,
+.decision-log h5 {
+  margin: 0 0 8px;
+}
+
+.fork-branches,
+.decision-log ul {
+  margin: 8px 0;
+  padding-left: 18px;
+}
+
+.fork-branch {
+  margin-bottom: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.fork-current-choice {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--ok-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.fork-current-choice.conflict,
+.fork-current-choice.stale {
+  background: var(--danger-soft);
+}
+
+.decision-form fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0 0 8px;
+}
+
+.decision-form label {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  margin-right: 12px;
+  font-size: 13px;
+}
+
+.chain-fork-adjudicated,
+.chain-adjudicated-current {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.chain-adjudicated-path,
+.chain-adjudicated-blocked-path {
+  background: #eef1f6;
+  color: var(--muted);
+}
+
+.chain-adjudicated-rejected-branch,
+.chain-fork-conflict,
+.chain-fork-decision-stale {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .chain-current {
   background: var(--ok-soft);
   color: var(--ok);
