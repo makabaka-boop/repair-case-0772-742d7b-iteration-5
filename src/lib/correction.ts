@@ -27,6 +27,11 @@ import {
   type ReleaseSlip,
   type ReleaseSnapshot
 } from './release';
+import {
+  resolveForkAdjudication,
+  type ForkAdjudication,
+  type ForkResolution
+} from './forkAdjudication';
 
 export interface CreateCorrectionInput {
   text: string;
@@ -129,6 +134,10 @@ export interface CorrectionChainInfo {
   childrenById: ReadonlyMap<string, ReleaseSlip[]>;
   /** 全部分叉冲突（跨页签合并后可能出现）。 */
   forks: CorrectionFork[];
+  /** 每个分叉点 id → 人工裁决解析状态（与历史徽标、共享会话同源）。 */
+  forkResolutions: ReadonlyMap<string, ForkResolution>;
+  /** 分叉分支单据 id → 被污染的原因：落选于人工裁决，或分叉尚未裁决。 */
+  forkBranchCauseById: ReadonlyMap<string, 'unchosen' | 'unresolved'>;
 }
 
 /**
@@ -136,9 +145,19 @@ export interface CorrectionChainInfo {
  * 页面展示都依据同一份 `correction` 关联数据得出一致结论。
  *
  * 关键规则：分叉（两张及以上更正单指向同一单据）绝不凭时间先后
- * 悄悄选出现行版本——分叉点与其全部后继都不作现行认定，只标记冲突。
+ * 悄悄选出现行版本——未经人工裁决时，分叉点与其全部后继都不作现行认定。
+ *
+ * 人工裁决（可选参数，缺省为无裁决，行为与旧版一致）：
+ *  - 裁决解析为 resolved 的分叉，只污染**落选**分支；被选分支恢复正常链分析，
+ *    其终端可以重新被认定为现行版本；
+ *  - 被选分支内部若仍有未裁决分叉，污染照常传播，不得提前宣布终端现行；
+ *  - 旧裁决绑定的后继集合与当前不一致（迟到新分支）时自动失效，等同于未裁决；
+ *  - 多张有效裁决选择不一致时保持冲突，绝不“最后写入者获胜”。
  */
-export function analyzeCorrectionChains(slips: readonly ReleaseSlip[]): CorrectionChainInfo {
+export function analyzeCorrectionChains(
+  slips: readonly ReleaseSlip[],
+  adjudications: readonly ForkAdjudication[] = []
+): CorrectionChainInfo {
   const byId = new Map<string, ReleaseSlip>();
   for (const slip of slips) {
     if (!byId.has(slip.id)) {
@@ -173,18 +192,38 @@ export function analyzeCorrectionChains(slips: readonly ReleaseSlip[]): Correcti
     }
   }
 
-  // 分叉污染传播：分叉点的全部后继（分支上的更正链）同样不作现行认定。
+  // 每个分叉点的人工裁决解析：同一分叉点、同一后继集合、同一批裁决记录，
+  // 链分析、共享会话与历史徽标得到的是同一个结论。
+  const forkResolutions = new Map<string, ForkResolution>();
+  for (const fork of forks) {
+    forkResolutions.set(fork.parentId, resolveForkAdjudication(fork.parentId, fork.slipIds, adjudications));
+  }
+
+  // 分叉污染传播：未裁决 / 已失效 / 裁决冲突的分叉点，其全部后继不作现行认定；
+  // 已裁决的分叉点只污染落选分支，被选分支恢复正常链分析（其内部若还有
+  // 未裁决分叉，会在传播到那里时再次被污染，不会提前宣布终端现行）。
   //  visited 集合同时保证异常数据（如互相指向成环）不会死循环。
   const tainted = new Set<string>();
-  const stack = [...forkedIds];
+  const forkBranchCauseById = new Map<string, 'unchosen' | 'unresolved'>();
+  const stack: Array<{ id: string; cause: 'unchosen' | 'unresolved' }> = [];
+  for (const fork of forks) {
+    const resolution = forkResolutions.get(fork.parentId)!;
+    for (const child of childrenById.get(fork.parentId) ?? []) {
+      if (resolution.state === 'resolved' && child.id === resolution.chosenSuccessorId) {
+        continue;
+      }
+      stack.push({ id: child.id, cause: resolution.state === 'resolved' ? 'unchosen' : 'unresolved' });
+    }
+  }
   while (stack.length > 0) {
-    const id = stack.pop()!;
+    const { id, cause } = stack.pop()!;
     if (tainted.has(id)) {
       continue;
     }
     tainted.add(id);
+    forkBranchCauseById.set(id, cause);
     for (const child of childrenById.get(id) ?? []) {
-      stack.push(child.id);
+      stack.push({ id: child.id, cause });
     }
   }
 
@@ -206,7 +245,7 @@ export function analyzeCorrectionChains(slips: readonly ReleaseSlip[]): Correcti
     statusById.set(slip.id, status);
   }
 
-  return { statusById, childrenById, forks };
+  return { statusById, childrenById, forks, forkResolutions, forkBranchCauseById };
 }
 
 /** 该单据是否卷入更正链（本身是更正单，或已被更正单指向）：决定历史页是否展示链状态徽标。 */

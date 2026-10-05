@@ -1108,6 +1108,81 @@ input[type='number'].input-invalid:focus,
   line-height: 1.7;
 }
 
+/* ---- 人工分叉裁决 ---- */
+.correction-fork-resolved {
+  margin-bottom: 12px;
+  padding: 12px 16px;
+  border: 1px solid #b7dfc0;
+  border-radius: 8px;
+  background: var(--ok-soft);
+}
+
+.correction-fork-resolved h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  color: var(--ok);
+}
+
+.correction-fork-resolved ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.fork-adjudication {
+  margin: 0 0 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-soft);
+}
+
+.fork-adjudication h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  color: var(--accent);
+}
+
+.fork-adjudication-state {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.fork-branch-list {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.8;
+  list-style: none;
+}
+
+.fork-branch-choice {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  cursor: pointer;
+}
+
+.fork-adjudication .field {
+  margin-bottom: 8px;
+}
+
+.fork-adjudication-records {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.fork-adjudication-warning p,
+.fork-adjudication-error p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
 .chain-status {
   display: inline-block;
   margin: 0 0 8px;

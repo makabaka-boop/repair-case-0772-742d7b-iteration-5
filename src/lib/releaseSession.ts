@@ -20,6 +20,13 @@ import {
   loadReleaseState,
   type StoredReleases
 } from './releaseStorage';
+import type { ForkAdjudication } from './forkAdjudication';
+import {
+  adjudicationFailureWarning,
+  appendForkAdjudication,
+  loadAdjudicationState,
+  type StoredAdjudications
+} from './forkAdjudicationStorage';
 import { useDraftSession } from './draftSession';
 import { useCalibrationSession } from './calibrationSession';
 
@@ -32,6 +39,8 @@ export interface IssueOutcome {
 export interface ReleaseSession {
   /** 历史放行单存档（响应式，跨标签页更新后重新加载）。 */
   archive: Ref<StoredReleases>;
+  /** 人工分叉裁决存档（响应式，跨标签页更新后重新加载）。 */
+  adjudications: Ref<StoredAdjudications>;
   /** 本标签本次会话的当前授权单据；刷新后为 null。 */
   activeSlip: Ref<ReleaseSlip | null>;
   /** 最近被失效的单据（用于明确提示改动后授权已失效）。 */
@@ -48,7 +57,10 @@ export interface ReleaseSession {
   /** 退出更正规程（取消或签发成功后）；不影响已带入的草稿内容。 */
   cancelCorrection: () => void;
   issue: (slip: ReleaseSlip) => IssueOutcome;
+  /** 记录一张人工分叉裁决（只追加；不改写任何放行单、更正单或其它裁决）。 */
+  decide: (adjudication: ForkAdjudication) => IssueOutcome;
   reloadArchive: () => void;
+  reloadAdjudications: () => void;
 }
 
 let singleton: ReleaseSession | null = null;
@@ -67,6 +79,7 @@ export function useReleaseSession(): ReleaseSession {
     const draft = useDraftSession();
     const calibration = useCalibrationSession();
     const archive = ref(loadReleaseState());
+    const adjudications = ref(loadAdjudicationState());
     const activeSlip = ref<ReleaseSlip | null>(null);
     const invalidatedSlip = ref<ReleaseSlip | null>(null);
     const correctionTarget = ref<ReleaseSlip | null>(null);
@@ -74,6 +87,10 @@ export function useReleaseSession(): ReleaseSession {
 
     function reloadArchive() {
       archive.value = loadReleaseState();
+    }
+
+    function reloadAdjudications() {
+      adjudications.value = loadAdjudicationState();
     }
 
     function beginCorrection(slip: ReleaseSlip) {
@@ -102,6 +119,17 @@ export function useReleaseSession(): ReleaseSession {
       return { ok: true, error: null };
     }
 
+    function decide(adjudication: ForkAdjudication): IssueOutcome {
+      const outcome = appendForkAdjudication(adjudication);
+      // 无论成功失败都重新加载：成功时同步交错合并后的完整裁决历史；
+      // 失败（配额 / 编号冲突 / 分叉绑定失配 / 保护态）时让界面看到最新真实存档。
+      reloadAdjudications();
+      if (!outcome.ok) {
+        return { ok: false, error: adjudicationFailureWarning(outcome.kind).message };
+      }
+      return { ok: true, error: null };
+    }
+
     // 闸门依据的任何变化都让当前授权立即失效（历史单据不受影响）。
     // 监听在单例作用域上，放行页未挂载时（如在单稿页改文字）同样生效。
     // 注意：文字 / 行宽是整体替换的原始值，不能与数组共用 deep 监听（deep 不追踪原始值替换）。
@@ -121,6 +149,7 @@ export function useReleaseSession(): ReleaseSession {
 
     return {
       archive,
+      adjudications,
       activeSlip,
       invalidatedSlip,
       correctionTarget,
@@ -128,7 +157,9 @@ export function useReleaseSession(): ReleaseSession {
       beginCorrection,
       cancelCorrection,
       issue,
-      reloadArchive
+      decide,
+      reloadArchive,
+      reloadAdjudications
     };
   }) as ReleaseSession;
   return singleton;
